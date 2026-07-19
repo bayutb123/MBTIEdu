@@ -3,6 +3,8 @@ package com.bayutb.gombti
 import android.content.Intent
 import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.Fragment
 import com.bayutb.gombti.databinding.ActivityMainBinding
 import com.bayutb.gombti.model.LoginSession
@@ -25,6 +27,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets()
 
         sessionManager = SessionManager(this@MainActivity)
         userId = sessionManager.checkAuth()
@@ -95,6 +98,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+
+    private fun applySystemBarInsets() {
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            WindowInsetsCompat.CONSUMED
+        }
+    }
 
     private fun loadFragment(fragment: Fragment, bundle: Bundle) {
         val fragmentTransaction = supportFragmentManager.beginTransaction()

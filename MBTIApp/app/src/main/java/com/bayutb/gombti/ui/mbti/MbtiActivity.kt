@@ -10,6 +10,8 @@ import android.view.View
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import com.bayutb.gombti.R
 import com.bayutb.gombti.api.ApiConfig
 import com.bayutb.gombti.api.request.MbtiRequest
@@ -37,6 +39,11 @@ class MbtiActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMbtiBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            WindowInsetsCompat.CONSUMED
+        }
 
         sessionManager = RegisterSessionManager(this@MbtiActivity)
 
