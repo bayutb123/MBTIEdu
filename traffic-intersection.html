@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Traffic Intersection — Night Loop</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: radial-gradient(circle at 50% 40%, #12151c 0%, #05070b 70%, #000 100%);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #e8ecf3;
+  }
+  #app {
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    padding: 24px;
+  }
+  #scene {
+    position: relative;
+    width: min(86vw, 86vh, 620px);
+    height: min(86vw, 86vh, 620px);
+    border: 1px solid rgba(255, 255, 255, 0.9);
+    border-radius: 4px;
+    box-shadow: 0 0 60px rgba(0, 0, 0, 0.8), inset 0 0 40px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
+    background: #04060a;
+  }
+  #scene canvas { display: block; width: 100%; height: 100%; }
+  #progressWrap {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.08);
+  }
+  #progress {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #3ad1ff, #7bffb0);
+    box-shadow: 0 0 8px #3ad1ff;
+    transition: width 0.06s linear;
+  }
+  #hint {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: rgba(232, 236, 243, 0.75);
+    letter-spacing: 0.5px;
+    font-size: 14px;
+    background: rgba(4, 6, 10, 0.55);
+    backdrop-filter: blur(1px);
+    pointer-events: none;
+    transition: opacity 0.4s ease;
+  }
+  #hint.hidden { opacity: 0; }
+  #controls { display: flex; align-items: center; gap: 14px; }
+  #startBtn {
+    appearance: none;
+    border: 1px solid rgba(123, 255, 176, 0.5);
+    background: linear-gradient(180deg, rgba(30, 40, 52, 0.9), rgba(16, 22, 30, 0.9));
+    color: #eafff3;
+    padding: 11px 28px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    border-radius: 10px;
+    cursor: pointer;
+    box-shadow: 0 0 18px rgba(58, 209, 255, 0.15);
+    transition: transform 0.08s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+  }
+  #startBtn:hover { box-shadow: 0 0 26px rgba(58, 209, 255, 0.35); border-color: rgba(123, 255, 176, 0.9); }
+  #startBtn:active { transform: translateY(1px); }
+  #timeLabel { font-variant-numeric: tabular-nums; font-size: 13px; color: rgba(232, 236, 243, 0.6); min-width: 92px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="scene">
+    <canvas id="c" width="640" height="640"></canvas>
+    <div id="progressWrap"><div id="progress"></div></div>
+    <div id="hint">Press Start to run the 30-second loop</div>
+  </div>
+  <div id="controls">
+    <button id="startBtn">Start</button>
+    <span id="timeLabel">00.0s / 30.0s</span>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width;            // internal square resolution
+  const cx = W / 2, cy = W / 2;
+
+  // ---- Geometry ----------------------------------------------------------
+  const laneW = W * 0.062;           // width of a single lane
+  const roadHalf = 2 * laneW;        // half road width (2 lanes each side)
+  const carLen = laneW * 1.55;
+  const carW = laneW * 0.6;
+  const minGap = carLen * 0.55;      // gap kept behind car ahead
+
+  // ---- Timing ------------------------------------------------------------
+  const LOOP = 30;                   // seconds, seamless loop length
+  const LIGHT_CYCLE = 15;            // two cycles per loop
+  // Light phases within one 15s cycle: NS green -> NS yellow -> all red -> EW green -> EW yellow -> all red
+  function lightState(t) {
+    const p = ((t % LIGHT_CYCLE) + LIGHT_CYCLE) % LIGHT_CYCLE;
+    let ns = "red", ew = "red";
+    if (p < 5.5)       { ns = "green"; }
+    else if (p < 7.0)  { ns = "yellow"; }
+    else if (p < 7.5)  { /* all red */ }
+    else if (p < 13.0) { ew = "green"; }
+    else if (p < 14.5) { ew = "yellow"; }
+    return { ns, ew };
+  }
+
+  // ---- Lane definitions --------------------------------------------------
+  // Right-hand traffic. Each lane has a travel direction and a mapping s -> (x,y).
+  // s = distance travelled by the front bumper from the entry edge (0..W).
+  function buildLanes() {
+    const off = (k) => (0.5 + k) * laneW;   // perpendicular offset of lane k from road centerline
+    const lanes = [];
+    // Northbound (up), east side (x > cx). y = W - s.
+    for (let k = 0; k < 2; k++) lanes.push({
+      group: "ns", axis: "y", sign: -1,
+      laneX: cx + off(k),
+      pos: (s) => ({ x: cx + off(k), y: W - s, ang: -Math.PI / 2 }),
+      stopS: W - (cy + roadHalf),
+      interval: 2.5, phase: k * 1.25,
+    });
+    // Southbound (down), west side (x < cx). y = s.
+    for (let k = 0; k < 2; k++) lanes.push({
+      group: "ns", axis: "y", sign: 1,
+      laneX: cx - off(k),
+      pos: (s) => ({ x: cx - off(k), y: s, ang: Math.PI / 2 }),
+      stopS: cy - roadHalf,
+      interval: 3.0, phase: 0.6 + k * 1.5,
+    });
+    // Eastbound (right), south side (y > cy). x = s.
+    for (let k = 0; k < 2; k++) lanes.push({
+      group: "ew", axis: "x", sign: 1,
+      laneY: cy + off(k),
+      pos: (s) => ({ x: s, y: cy + off(k), ang: 0 }),
+      stopS: cx - roadHalf,
+      interval: 3.75, phase: k * 1.875,
+    });
+    // Westbound (left), north side (y < cy). x = W - s.
+    for (let k = 0; k < 2; k++) lanes.push({
+      group: "ew", axis: "x", sign: -1,
+      laneY: cy - off(k),
+      pos: (s) => ({ x: W - s, y: cy - off(k), ang: Math.PI }),
+      stopS: W - (cx + roadHalf),
+      interval: 3.0, phase: 1.2 + k * 1.5,
+    });
+    return lanes;
+  }
+  const LANES = buildLanes();
+
+  const CAR_COLORS = [
+    "#d94f4f", "#4f8fd9", "#e0b64a", "#57c785",
+    "#c98ce0", "#e08a4a", "#7fd7e0", "#c9ccd6",
+  ];
+
+  // ---- Simulation state --------------------------------------------------
+  const V_MAX = W * 0.19;            // px/s
+  const ACCEL = W * 0.30;
+  const DECEL = W * 0.55;
+  const exitS = W + carLen;
+
+  let dyn;          // per-lane dynamic state
+  let simTime;      // seconds within the light cycle domain
+  let spawnCounter; // global count for color/lane variety
+  let snapshot;     // steady-state snapshot restored each loop
+
+  function resetState() {
+    dyn = LANES.map((L) => ({ cars: [], nextSpawn: L.phase, count: 0 }));
+    simTime = 0;
+    spawnCounter = 0;
+  }
+
+  function trySpawn(li) {
+    const L = LANES[li], d = dyn[li];
+    // entry clear if the last (rear-most) car has advanced enough
+    const last = d.cars[d.cars.length - 1];
+    if (last && last.s < carLen + minGap) return false;
+    d.cars.push({
+      s: 0,
+      v: V_MAX * 0.6,
+      color: CAR_COLORS[spawnCounter % CAR_COLORS.length],
+    });
+    d.count++; spawnCounter++;
+    return true;
+  }
+
+  function step(dt) {
+    simTime += dt;
+    const light = lightState(simTime);
+
+    for (let li = 0; li < LANES.length; li++) {
+      const L = LANES[li], d = dyn[li];
+
+      // spawns
+      while (simTime >= d.nextSpawn) {
+        if (trySpawn(li)) d.nextSpawn += L.interval;
+        else { d.nextSpawn += 0.3; break; }
+      }
+
+      const state = light[L.group];
+      const cars = d.cars;
+      for (let i = 0; i < cars.length; i++) {
+        const car = cars[i];
+        const ahead = cars[i - 1];
+
+        // constraint from car ahead (front must trail its rear)
+        let maxFront = Infinity;
+        if (ahead) maxFront = Math.min(maxFront, ahead.s - carLen - minGap);
+
+        // constraint from the traffic light
+        const before = car.s < L.stopS;
+        let mustStop = false;
+        if (before) {
+          if (state === "red") mustStop = true;
+          else if (state === "yellow" && car.s < L.stopS - carLen * 1.2) mustStop = true;
+        }
+        if (mustStop) maxFront = Math.min(maxFront, L.stopS);
+
+        // smooth accelerate / brake toward maxFront
+        let v = car.v;
+        const room = maxFront - car.s;
+        const vSafe = room > 0 ? Math.sqrt(2 * DECEL * room) : 0;
+        v = Math.min(v + ACCEL * dt, V_MAX, vSafe);
+        if (v < 0) v = 0;
+        car.v = v;
+        car.s += v * dt;
+        if (car.s > maxFront) { car.s = maxFront; car.v = 0; }
+      }
+
+      // despawn cars fully past the far edge
+      while (cars.length && cars[0].s > exitS) cars.shift();
+    }
+  }
+
+  // Warm up to a steady-state periodic orbit, then snapshot for seamless loop.
+  function warmUp() {
+    resetState();
+    const dt = 1 / 60;
+    for (let i = 0; i < Math.round(LOOP / dt); i++) step(dt);
+    // realign light phase to a clean cycle boundary
+    simTime = 0;
+    snapshot = {
+      simTime: 0,
+      spawnCounter,
+      dyn: dyn.map((d) => ({
+        cars: d.cars.map((c) => ({ s: c.s, v: c.v, color: c.color })),
+        nextSpawn: d.nextSpawn % 30 === 0 ? 0 : d.nextSpawn, // keep phase
+        count: d.count,
+      })),
+    };
+    restoreSnapshot();
+  }
+
+  function restoreSnapshot() {
+    simTime = 0;
+    spawnCounter = snapshot.spawnCounter;
+    dyn = snapshot.dyn.map((d, li) => ({
+      cars: d.cars.map((c) => ({ s: c.s, v: c.v, color: c.color })),
+      // recompute nextSpawn from lane phase so spawns realign to t=0
+      nextSpawn: nextSpawnFromPhase(li),
+      count: d.count,
+    }));
+  }
+
+  function nextSpawnFromPhase(li) {
+    const L = LANES[li];
+    let ns = L.phase;
+    while (ns < 0) ns += L.interval;
+    return ns;
+  }
+
+  // ---- Rendering ---------------------------------------------------------
+  function drawScene() {
+    const light = lightState(simTime);
+
+    // background ground
+    ctx.clearRect(0, 0, W, W);
+    const g = ctx.createRadialGradient(cx, cy * 0.85, W * 0.1, cx, cy, W * 0.75);
+    g.addColorStop(0, "#101722");
+    g.addColorStop(1, "#070a0f");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, W);
+
+    // grass / blocks in the four corners (subtle)
+    ctx.fillStyle = "#0c1410";
+    const bs = cx - roadHalf;
+    ctx.fillRect(0, 0, bs, bs);
+    ctx.fillRect(cx + roadHalf, 0, bs, bs);
+    ctx.fillRect(0, cy + roadHalf, bs, bs);
+    ctx.fillRect(cx + roadHalf, cy + roadHalf, bs, bs);
+
+    // roads
+    ctx.fillStyle = "#1b1f27";
+    ctx.fillRect(0, cy - roadHalf, W, roadHalf * 2);   // horizontal
+    ctx.fillRect(cx - roadHalf, 0, roadHalf * 2, W);   // vertical
+    // intersection slightly lighter
+    ctx.fillStyle = "#20242d";
+    ctx.fillRect(cx - roadHalf, cy - roadHalf, roadHalf * 2, roadHalf * 2);
+
+    drawMarkings();
+    drawCrosswalks();
+
+    // cars
+    for (let li = 0; li < LANES.length; li++) {
+      const L = LANES[li];
+      for (const car of dyn[li].cars) {
+        const p = L.pos(car.s);
+        drawCar(p.x, p.y, p.ang, car.color);
+      }
+    }
+
+    drawSignals(light);
+    vignette();
+  }
+
+  function dashedLine(x1, y1, x2, y2, dash, color, width) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawMarkings() {
+    // center double-yellow-ish (single dashed) on each road, and lane dividers
+    // horizontal road: center line at cy, lane dividers at cy +/- laneW
+    dashedLine(0, cy, cx - roadHalf, cy, [18, 16], "rgba(230,200,90,0.55)", 2);
+    dashedLine(cx + roadHalf, cy, W, cy, [18, 16], "rgba(230,200,90,0.55)", 2);
+    dashedLine(0, cy - laneW, cx - roadHalf, cy - laneW, [14, 18], "rgba(220,220,220,0.28)", 1.5);
+    dashedLine(cx + roadHalf, cy - laneW, W, cy - laneW, [14, 18], "rgba(220,220,220,0.28)", 1.5);
+    dashedLine(0, cy + laneW, cx - roadHalf, cy + laneW, [14, 18], "rgba(220,220,220,0.28)", 1.5);
+    dashedLine(cx + roadHalf, cy + laneW, W, cy + laneW, [14, 18], "rgba(220,220,220,0.28)", 1.5);
+
+    // vertical road
+    dashedLine(cx, 0, cx, cy - roadHalf, [18, 16], "rgba(230,200,90,0.55)", 2);
+    dashedLine(cx, cy + roadHalf, cx, W, [18, 16], "rgba(230,200,90,0.55)", 2);
+    dashedLine(cx - laneW, 0, cx - laneW, cy - roadHalf, [14, 18], "rgba(220,220,220,0.28)", 1.5);
+    dashedLine(cx - laneW, cy + roadHalf, cx - laneW, W, [14, 18], "rgba(220,220,220,0.28)", 1.5);
+    dashedLine(cx + laneW, 0, cx + laneW, cy - roadHalf, [14, 18], "rgba(220,220,220,0.28)", 1.5);
+    dashedLine(cx + laneW, cy + roadHalf, cx + laneW, W, [14, 18], "rgba(220,220,220,0.28)", 1.5);
+
+    // stop lines (solid white) just outside the intersection
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = "rgba(235,235,235,0.65)";
+    ctx.lineWidth = 3;
+    // northbound (east side, x in [cx, cx+roadHalf]) stop at y=cy+roadHalf
+    line(cx, cy + roadHalf, cx + roadHalf, cy + roadHalf);
+    // southbound (west side) stop at y=cy-roadHalf
+    line(cx - roadHalf, cy - roadHalf, cx, cy - roadHalf);
+    // eastbound (south side) stop at x=cx-roadHalf
+    line(cx - roadHalf, cy, cx - roadHalf, cy + roadHalf);
+    // westbound (north side) stop at x=cx+roadHalf
+    line(cx + roadHalf, cy - roadHalf, cx + roadHalf, cy);
+    ctx.restore();
+  }
+
+  function line(x1, y1, x2, y2) {
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+
+  function drawCrosswalks() {
+    ctx.save();
+    ctx.fillStyle = "rgba(220,220,220,0.16)";
+    const cwWidth = laneW * 0.7;           // depth of crosswalk band
+    const stripeN = 7;
+    // top & bottom (horizontal stripes across the vertical road)
+    for (let i = 0; i < stripeN; i++) {
+      const sx = cx - roadHalf + (i + 0.15) * (roadHalf * 2) / stripeN;
+      const sw = (roadHalf * 2) / stripeN * 0.6;
+      ctx.fillRect(sx, cy - roadHalf - cwWidth, sw, cwWidth);
+      ctx.fillRect(sx, cy + roadHalf, sw, cwWidth);
+    }
+    // left & right (vertical stripes across horizontal road)
+    for (let i = 0; i < stripeN; i++) {
+      const sy = cy - roadHalf + (i + 0.15) * (roadHalf * 2) / stripeN;
+      const sh = (roadHalf * 2) / stripeN * 0.6;
+      ctx.fillRect(cx - roadHalf - cwWidth, sy, cwWidth, sh);
+      ctx.fillRect(cx + roadHalf, sy, cwWidth, sh);
+    }
+    ctx.restore();
+  }
+
+  function drawCar(x, y, ang, color) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(ang);
+    // local frame: +x is forward (travel direction)
+    const hl = carLen / 2, hw = carW / 2;
+
+    // soft ground shadow
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = "#000";
+    roundRect(-hl - 2, -hw - 2, carLen + 4, carW + 4, 4);
+    ctx.fill();
+    ctx.restore();
+
+    // headlight beams (glow cone forward) using additive blend
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const beam = ctx.createRadialGradient(hl, 0, 2, hl + carLen * 1.7, 0, carLen * 2.1);
+    beam.addColorStop(0, "rgba(255,246,210,0.55)");
+    beam.addColorStop(0.4, "rgba(255,240,190,0.16)");
+    beam.addColorStop(1, "rgba(255,240,190,0)");
+    ctx.fillStyle = beam;
+    ctx.beginPath();
+    ctx.moveTo(hl, -hw);
+    ctx.lineTo(hl + carLen * 2.0, -carW * 1.7);
+    ctx.lineTo(hl + carLen * 2.0, carW * 1.7);
+    ctx.lineTo(hl, hw);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    // body
+    ctx.fillStyle = color;
+    roundRect(-hl, -hw, carLen, carW, 4);
+    ctx.fill();
+    // roof / windshield
+    ctx.fillStyle = "rgba(15,20,28,0.85)";
+    roundRect(-hl * 0.15, -hw * 0.72, carLen * 0.42, carW * 1.44, 3);
+    ctx.fill();
+    // body sheen
+    ctx.fillStyle = "rgba(255,255,255,0.08)";
+    roundRect(-hl, -hw, carLen, carW * 0.32, 4);
+    ctx.fill();
+
+    // headlights (front dots) + taillights (rear)
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    glowDot(hl - 1.5, -hw * 0.55, 3.2, "rgba(255,248,220,0.95)", 10, "#fff4c4");
+    glowDot(hl - 1.5, hw * 0.55, 3.2, "rgba(255,248,220,0.95)", 10, "#fff4c4");
+    glowDot(-hl + 1.5, -hw * 0.55, 2.6, "rgba(255,70,60,0.95)", 8, "#ff3b30");
+    glowDot(-hl + 1.5, hw * 0.55, 2.6, "rgba(255,70,60,0.95)", 8, "#ff3b30");
+    ctx.restore();
+
+    ctx.restore();
+  }
+
+  function glowDot(x, y, r, fill, blur, shadow) {
+    ctx.save();
+    ctx.shadowBlur = blur;
+    ctx.shadowColor = shadow;
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawSignals(light) {
+    const m = laneW * 0.55;
+    // {x,y, group, vertical}
+    const heads = [
+      { x: cx + roadHalf + m, y: cy + roadHalf + m, group: "ns" }, // northbound
+      { x: cx - roadHalf - m, y: cy - roadHalf - m, group: "ns" }, // southbound
+      { x: cx - roadHalf - m, y: cy + roadHalf + m, group: "ew" }, // eastbound
+      { x: cx + roadHalf + m, y: cy - roadHalf - m, group: "ew" }, // westbound
+    ];
+    for (const h of heads) drawSignalHead(h.x, h.y, light[h.group]);
+  }
+
+  function drawSignalHead(x, y, state) {
+    const r = laneW * 0.16;
+    const pad = r * 0.9;
+    const hw = r + pad;
+    const hh = r * 6 + pad * 2;
+    ctx.save();
+    ctx.translate(x, y);
+    // housing
+    ctx.fillStyle = "#0a0d12";
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 1;
+    roundRect(-hw, -hh / 2, hw * 2, hh, 4);
+    ctx.fill(); ctx.stroke();
+
+    const yTop = -hh / 2 + pad + r;
+    lamp(0, yTop,             r, state === "red",    "#ff3b30");
+    lamp(0, yTop + r * 2 + 2, r, state === "yellow", "#ffd23b");
+    lamp(0, yTop + r * 4 + 4, r, state === "green",  "#39e070");
+    ctx.restore();
+  }
+
+  function lamp(x, y, r, on, color) {
+    ctx.save();
+    if (on) {
+      ctx.globalCompositeOperation = "lighter";
+      ctx.shadowBlur = 18;
+      ctx.shadowColor = color;
+      ctx.fillStyle = color;
+    } else {
+      ctx.fillStyle = "rgba(255,255,255,0.06)";
+    }
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function vignette() {
+    ctx.save();
+    const v = ctx.createRadialGradient(cx, cy, W * 0.28, cx, cy, W * 0.72);
+    v.addColorStop(0, "rgba(0,0,0,0)");
+    v.addColorStop(1, "rgba(0,0,0,0.55)");
+    ctx.fillStyle = v;
+    ctx.fillRect(0, 0, W, W);
+    ctx.restore();
+  }
+
+  // ---- Main loop ---------------------------------------------------------
+  const hint = document.getElementById("hint");
+  const startBtn = document.getElementById("startBtn");
+  const progress = document.getElementById("progress");
+  const timeLabel = document.getElementById("timeLabel");
+
+  let running = false;
+  let loopElapsed = 0;   // 0..30 within the current loop
+  let lastTs = 0;
+
+  function frame(ts) {
+    if (!running) return;
+    let dt = (ts - lastTs) / 1000;
+    lastTs = ts;
+    if (!isFinite(dt) || dt <= 0) dt = 1 / 60;
+    if (dt > 0.05) dt = 0.05;          // clamp big gaps
+
+    loopElapsed += dt;
+    if (loopElapsed >= LOOP) {
+      loopElapsed -= LOOP;
+      restoreSnapshot();               // seamless restart
+    }
+    step(dt);
+    drawScene();
+
+    progress.style.width = (loopElapsed / LOOP * 100).toFixed(2) + "%";
+    timeLabel.textContent = loopElapsed.toFixed(1).padStart(4, "0") + "s / 30.0s";
+
+    requestAnimationFrame(frame);
+  }
+
+  function start() {
+    warmUp();
+    loopElapsed = 0;
+    hint.classList.add("hidden");
+    startBtn.textContent = "Restart";
+    if (!running) {
+      running = true;
+      lastTs = performance.now();
+      requestAnimationFrame(frame);
+    } else {
+      lastTs = performance.now();
+    }
+  }
+
+  startBtn.addEventListener("click", start);
+
+  // draw a static preview frame before starting
+  warmUp();
+  drawScene();
+})();
+</script>
+</body>
+</html>
